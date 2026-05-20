@@ -1,84 +1,144 @@
 import cv2
 import mediapipe as mp
-import numpy as np
 import pyttsx3
-from collections import deque
+import queue
+import threading
 
-# Initialize webcam
-cap = cv2.VideoCapture(0)
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(
-    static_image_mode=False,
-    max_num_hands=1,
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.7)
-mp_draw = mp.solutions.drawing_utils
-engine = pyttsx3.init()
 
+TIP_INDICES = (4, 8, 12, 16, 20)
+THUMB_INDEX_PINCH = 0.05 ** 2
+FAR_FINGER_DISTANCE = 0.10 ** 2
+THUMB_MIDDLE_PINCH = 0.05 ** 2
+INDEX_MIDDLE_PINCH = 0.04 ** 2
 COOLDOWN_FRAMES = 20
-cooldown_counter = 0
+WINDOW_NAME = "Hand Gesture Recognition"
+
+
+def squared_distance(point_a, point_b):
+    dx = point_a.x - point_b.x
+    dy = point_a.y - point_b.y
+    return (dx * dx) + (dy * dy)
+
 
 def gesture_to_text(landmarks):
     if landmarks is None:
         return None
-    # Landmarks for tips of thumb, index, middle, ring, pinky fingers
-    tips = [landmarks[i] for i in [4, 8, 12, 16, 20]]
-    thumb_tip, index_tip, middle_tip, ring_tip, pinky_tip = tips
 
-    # Calculate some distances between finger tips (heuristic)
-    dist_thumb_index = np.sqrt((thumb_tip.x - index_tip.x)**2 + (thumb_tip.y - index_tip.y)**2)
-    dist_thumb_middle = np.sqrt((thumb_tip.x - middle_tip.x)**2 + (thumb_tip.y - middle_tip.y)**2)
-    dist_index_middle = np.sqrt((index_tip.x - middle_tip.x)**2 + (index_tip.y - middle_tip.y)**2)
+    thumb_tip, index_tip, middle_tip, _, _ = (landmarks[index] for index in TIP_INDICES)
 
-    # Example gesture rules (customize as you collect more data!):
-    if dist_thumb_index < 0.05 and dist_thumb_middle > 0.1:
+    dist_thumb_index = squared_distance(thumb_tip, index_tip)
+    dist_thumb_middle = squared_distance(thumb_tip, middle_tip)
+    dist_index_middle = squared_distance(index_tip, middle_tip)
+
+    if dist_thumb_index < THUMB_INDEX_PINCH and dist_thumb_middle > FAR_FINGER_DISTANCE:
         return "Hello"
-    elif dist_thumb_index < 0.05 and dist_thumb_middle < 0.05:
+    if dist_thumb_index < THUMB_INDEX_PINCH and dist_thumb_middle < THUMB_MIDDLE_PINCH:
         return "How are you"
-    elif dist_index_middle < 0.04 and dist_thumb_index > 0.10:
+    if dist_index_middle < INDEX_MIDDLE_PINCH and dist_thumb_index > FAR_FINGER_DISTANCE:
         return "Nice to meet you"
-    else:
-        return None
+    return None
 
-recent_text = ""
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
-    frame = cv2.flip(frame, 1)
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    result = hands.process(rgb)
-    hand_landmarks = None
-    if result.multi_hand_landmarks:
-        for hand_lm in result.multi_hand_landmarks:
-            mp_draw.draw_landmarks(frame, hand_lm, mp_hands.HAND_CONNECTIONS)
-            hand_landmarks = hand_lm.landmark
+class SpeechWorker:
+    def __init__(self):
+        self._queue = queue.Queue(maxsize=1)
+        self._stop_signal = object()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
 
-    text = gesture_to_text(hand_landmarks)
+    def speak(self, text):
+        if self._queue.full():
+            return False
 
-    if cooldown_counter > 0:
-        cooldown_counter -= 1
+        self._queue.put_nowait(text)
+        return True
 
-    if text and (text != recent_text) and cooldown_counter == 0:
-        engine.say(text)
-        engine.runAndWait()
-        print(f"Recognized and speaking: {text}")
-        recent_text = text
-        cooldown_counter = COOLDOWN_FRAMES
+    def stop(self):
+        try:
+            self._queue.put_nowait(self._stop_signal)
+        except queue.Full:
+            self._queue.get_nowait()
+            self._queue.put_nowait(self._stop_signal)
+        self._thread.join(timeout=1)
 
-    # Reset recent_text when no gesture is detected
-    if text is None and cooldown_counter == 0:
-        recent_text = ""
+    def _run(self):
+        engine = pyttsx3.init()
+        while True:
+            item = self._queue.get()
+            if item is self._stop_signal:
+                break
 
-    # Overlay the recognized gesture on the frame
-    if text:
-        cv2.putText(frame, text, (10, 50), cv2.FONT_HERSHEY_SIMPLEX,
-                    1, (0, 255, 0), 2, cv2.LINE_AA)
+            engine.say(item)
+            engine.runAndWait()
 
-    cv2.imshow('Hand Gesture Recognition', frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
 
-cap.release()
-cv2.destroyAllWindows()
+def main():
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        raise RuntimeError("Unable to access webcam.")
+
+    mp_hands = mp.solutions.hands
+    mp_draw = mp.solutions.drawing_utils
+    speech_worker = SpeechWorker()
+    cooldown_counter = 0
+    recent_text = ""
+
+    try:
+        with mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.7,
+        ) as hands:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                frame = cv2.flip(frame, 1)
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                rgb_frame.flags.writeable = False
+                result = hands.process(rgb_frame)
+
+                hand_landmarks = None
+                if result.multi_hand_landmarks:
+                    first_hand = result.multi_hand_landmarks[0]
+                    mp_draw.draw_landmarks(frame, first_hand, mp_hands.HAND_CONNECTIONS)
+                    hand_landmarks = first_hand.landmark
+
+                text = gesture_to_text(hand_landmarks)
+
+                if cooldown_counter > 0:
+                    cooldown_counter -= 1
+
+                if text and text != recent_text and cooldown_counter == 0:
+                    if speech_worker.speak(text):
+                        print(f"Recognized and speaking: {text}")
+                        recent_text = text
+                        cooldown_counter = COOLDOWN_FRAMES
+                elif text is None and cooldown_counter == 0:
+                    recent_text = ""
+
+                if text:
+                    cv2.putText(
+                        frame,
+                        text,
+                        (10, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1,
+                        (0, 255, 0),
+                        2,
+                        cv2.LINE_AA,
+                    )
+
+                cv2.imshow(WINDOW_NAME, frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+    finally:
+        speech_worker.stop()
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
